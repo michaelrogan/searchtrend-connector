@@ -31,8 +31,14 @@ better for the anti-hindsight / backtest rule than rebased Trends data.
 PIT note: still snapshot raw pulls (PIT_NONE per blueprint); the edge is the
 12-24mo lead and it's worthless unless captured from today (archiver candidate).
 
-Data access: Wikimedia REST API is FREE, no key (needs a descriptive User-Agent).
-Polite client (~3 req/s).
+Data access: Wikimedia REST API is FREE, no key. Wikimedia refuses clients whose
+User-Agent carries no contact URL or email ("Please respect our robot policy",
+HTTP 403), so the default User-Agent names this repository. Polite client (~3 req/s).
+
+Article matching (build-2): a term is first looked up as an exact title (redirects
+followed to their target, disambiguation pages skipped); only if that fails does it
+fall back to the top search hit. Answers say which happened in "match"
+("exact" or "search"), so callers that need precision can reject search guesses.
 
 Transports: stdio (default) or streamable-http (MCP_TRANSPORT=http -> /mcp).
 """
@@ -56,9 +62,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 WIKI_REST = "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article"
 MAX_RPS = float(os.environ.get("SEARCHTREND_MAX_RPS", "3"))
-USER_AGENT = os.environ.get(
-    "SEARCHTREND_USER_AGENT",
-    "search-demand-mcp/1.0 (investment research; contact via deployer)")
+DEFAULT_USER_AGENT = (
+    "search-demand-mcp/1.1 (https://github.com/michaelrogan/searchtrend-connector) "
+    f"python-httpx/{httpx.__version__}")
+USER_AGENT = os.environ.get("SEARCHTREND_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
 GOOGLE_TRENDS_PROXY = os.environ.get("GOOGLE_TRENDS_PROXY", "").strip()
 
 _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -90,19 +97,37 @@ _limiter = _RateLimiter(MAX_RPS)
 # Wikipedia engine
 # ----------------------------------------------------------------------------
 
-async def _wiki_search(term: str, project: str) -> str | None:
-    """Resolve a term to the best-matching article title via opensearch."""
-    await _limiter.wait()
+async def _wiki_resolve(term: str, project: str) -> tuple[str | None, str | None]:
+    """Resolve a term to an article title.
+
+    First the exact title (redirects followed to their target; disambiguation pages
+    skipped), then the top search hit. Returns (title, "exact" | "search"), or
+    (None, None) when nothing matches.
+    """
     lang_host = f"https://{project}"
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True,
                                  headers={"User-Agent": USER_AGENT}) as c:
+        await _limiter.wait()
         r = await c.get(f"{lang_host}/w/api.php",
-                        params={"action": "opensearch", "search": term,
-                                "limit": "5", "namespace": "0", "format": "json"})
+                        params={"action": "query", "titles": term, "redirects": "1",
+                                "prop": "pageprops", "ppprop": "disambiguation",
+                                "format": "json", "formatversion": "2"})
+        r.raise_for_status()
+        pages = ((r.json() or {}).get("query") or {}).get("pages") or []
+        page = pages[0] if pages and isinstance(pages[0], dict) else {}
+        if (page.get("title") and not page.get("missing") and not page.get("invalid")
+                and page.get("ns", 0) == 0
+                and "disambiguation" not in (page.get("pageprops") or {})):
+            return page["title"], "exact"
+        await _limiter.wait()
+        r = await c.get(f"{lang_host}/w/api.php",
+                        params={"action": "opensearch", "search": term, "limit": "5",
+                                "namespace": "0", "redirects": "resolve",
+                                "format": "json"})
         r.raise_for_status()
         data = r.json()
     titles = data[1] if isinstance(data, list) and len(data) > 1 else []
-    return titles[0] if titles else None
+    return (titles[0], "search") if titles else (None, None)
 
 
 async def _wiki_pageviews(article: str, granularity: str, start: str,
@@ -188,17 +213,17 @@ async def demand_trend(term: str, months: int = 12, granularity: str = "monthly"
         The matched article, the pageview series, and a velocity read
         (igniting / rising / steady / fading + breakout flag).
     """
-    article = await _wiki_search(term, project)
+    article, match = await _wiki_resolve(term, project)
     if not article:
         return {"term": term, "found": False,
                 "note": "No matching Wikipedia article. Try a more specific term."}
     start, end = _window(months)
     series = await _wiki_pageviews(article, granularity, start, end, project)
     if not series:
-        return {"term": term, "article": article, "found": False,
+        return {"term": term, "article": article, "match": match, "found": False,
                 "note": "No pageview data for that article/window."}
     return {
-        "term": term, "article": article, "found": True,
+        "term": term, "article": article, "match": match, "found": True,
         "granularity": granularity, "source": "Wikipedia pageviews (absolute)",
         "velocity": _velocity(series, "views"),
         "series": series,
@@ -225,16 +250,16 @@ async def compare_demand(terms: list[str], months: int = 12,
     start, end = _window(months)
     rows = []
     for term in terms[:10]:
-        article = await _wiki_search(term, project)
+        article, match = await _wiki_resolve(term, project)
         if not article:
             rows.append({"term": term, "found": False})
             continue
         series = await _wiki_pageviews(article, "monthly", start, end, project)
         if not series:
-            rows.append({"term": term, "article": article, "found": False})
+            rows.append({"term": term, "article": article, "match": match, "found": False})
             continue
         v = _velocity(series, "views")
-        rows.append({"term": term, "article": article, "found": True,
+        rows.append({"term": term, "article": article, "match": match, "found": True,
                      "latest_views": v.get("latest"),
                      "velocity_read": v.get("read"),
                      "pct_vs_baseline": v.get("pct_vs_baseline")})
@@ -324,10 +349,11 @@ async def google_trends(terms: list[str], timeframe: str = "today 12-m",
 if __name__ == "__main__":
     import sys
     _pt = "available" if _get_pytrends()[0] is not None else "unavailable"
-    print(f"[search-demand] build-1 | dns_rebinding_protection="
+    print(f"[search-demand] build-2 | dns_rebinding_protection="
           f"{_security.enable_dns_rebinding_protection} | "
           f"engines=wikipedia+google_trends({_pt}) | "
           f"proxy={'set' if GOOGLE_TRENDS_PROXY else 'none'} | "
+          f"user_agent={'env' if USER_AGENT != DEFAULT_USER_AGENT else 'default'} | "
           f"transport={os.environ.get('MCP_TRANSPORT', 'stdio')}",
           file=sys.stderr, flush=True)
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
